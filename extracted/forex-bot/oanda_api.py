@@ -55,7 +55,8 @@ class OandaClient:
         return None
 
     def _post(self, path, data, max_retries=3):
-        """POST with retry logic."""
+        """POST with retry logic. For order endpoints, retries are disabled
+        to prevent duplicate fills (C2 fix)."""
         url = f'{self.base_url}{path}'
         for attempt in range(max_retries):
             try:
@@ -77,13 +78,17 @@ class OandaClient:
         return None
 
     def _put(self, path, data, max_retries=3):
-        """PUT with retry logic."""
+        """PUT with retry logic and 429 rate limit handling."""
         url = f'{self.base_url}{path}'
         for attempt in range(max_retries):
             try:
                 resp = self.session.put(url, json=data, timeout=30)
                 if resp.status_code in (200, 201):
                     return resp.json()
+                elif resp.status_code == 429:
+                    wait = 2 ** attempt
+                    log.warning(f'Rate limited on PUT, waiting {wait}s (attempt {attempt+1})')
+                    time.sleep(wait)
                 else:
                     log.error(f'PUT {path} → {resp.status_code}: {resp.text}')
                     if attempt < max_retries - 1:
@@ -184,9 +189,14 @@ class OandaClient:
                          params={'instruments': instrument})
         if data and 'prices' in data and data['prices']:
             price = data['prices'][0]
+            bids = price.get('bids', [])
+            asks = price.get('asks', [])
+            if not bids or not asks:
+                log.warning(f'{instrument}: empty price ladder (market closed?)')
+                return None
             return {
-                'bid': float(price['bids'][0]['price']),
-                'ask': float(price['asks'][0]['price']),
+                'bid': float(bids[0]['price']),
+                'ask': float(asks[0]['price']),
                 'time': price['time'],
                 'tradeable': price.get('tradeable', True),
             }
@@ -235,7 +245,9 @@ class OandaClient:
                 'comment': comment[:128],
             }
 
-        result = self._post(f'/v3/accounts/{self.account_id}/orders', order_data)
+        # max_retries=1: never retry market orders to prevent duplicate fills
+        result = self._post(f'/v3/accounts/{self.account_id}/orders', order_data,
+                            max_retries=1)
         if result:
             fill = result.get('orderFillTransaction')
             if fill:

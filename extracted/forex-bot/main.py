@@ -174,6 +174,7 @@ class ForexBot:
     def profile_all_pairs(self):
         """Profile windows for all pairs using current training data."""
         self.log.info('\n─── PROFILING WINDOWS ───')
+        now = datetime.now(timezone.utc)
         for instrument in PAIRS:
             try:
                 data = self.dm.get_data(instrument)
@@ -182,8 +183,20 @@ class ForexBot:
                     self.log.warning(f'{instrument}: insufficient data for profiling')
                     continue
 
+                # Data freshness check: skip profiling on stale data
+                latest_h1_time = h1.index[-1]
+                staleness = now - latest_h1_time.to_pydatetime().replace(tzinfo=timezone.utc) \
+                    if latest_h1_time.tzinfo is None else now - latest_h1_time
+                if staleness > timedelta(hours=6):
+                    self.log.warning(f'{instrument}: H1 data is stale '
+                                     f'(last bar: {latest_h1_time}, {staleness}), skipping profile')
+                    continue
+
                 windows, vov_thresh = profile_windows_for_pair(data, h1, instrument)
                 self.trader.set_pair_config(instrument, windows, vov_thresh)
+
+                # Trim old data to prevent unbounded memory growth
+                self.dm.trim_old_data(instrument)
 
             except Exception as e:
                 self.log.error(f'{instrument}: profiling failed: {e}', exc_info=True)
@@ -267,14 +280,23 @@ class ForexBot:
                         # Update data
                         self.update_data(instrument)
 
+                        # Capture the previously processed time BEFORE has_new_m5_bar updates it
+                        prev_time = self.last_m5_times.get(instrument)
+
                         # Check if new M5 bar available
                         if not self.has_new_m5_bar(instrument):
                             continue
 
-                        # Check for entry signal
-                        signal = self.trader.check_signal(instrument)
+                        # Pass the previously processed M5 bar time so check_signal
+                        # evaluates ALL new bars, not just the latest one
+                        signal = self.trader.check_signal(instrument, prev_time)
                         if signal:
-                            self.trader.execute_entry(instrument, signal)
+                            success = self.trader.execute_entry(instrument, signal)
+                            if not success:
+                                # Reset prev_active so signal can re-fire next bar
+                                # (prevents spread rejection from permanently
+                                # consuming the transition — C4 fix)
+                                self.trader.on_entry_failed(instrument)
 
                     except Exception as e:
                         self.log.error(f'{instrument} scan error: {e}', exc_info=True)

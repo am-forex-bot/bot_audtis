@@ -98,17 +98,53 @@ class Trader:
         self.total_trades = 0
 
     def set_pair_config(self, instrument, windows, vov_thresh):
-        """Set active windows and VoV threshold from profiler."""
+        """Set active windows and VoV threshold from profiler.
+        Seeds prev_active from the second-to-last M5 bar's active_mask
+        to prevent spurious signals after startup or reprofile."""
         self.active_windows[instrument] = windows
         self.vov_thresholds[instrument] = vov_thresh
-        if instrument not in self.prev_active:
-            self.prev_active[instrument] = False
+
+        # Seed prev_active from historical data to avoid spurious first signal
+        prev_was_active = self._compute_prev_active(instrument, windows, vov_thresh)
+        self.prev_active[instrument] = prev_was_active
+
         if instrument not in self.just_exited:
             self.just_exited[instrument] = False
 
-    def check_signal(self, instrument):
+    def _compute_prev_active(self, instrument, windows, vov_thresh):
+        """Compute whether the second-to-last M5 bar had active_mask=True.
+        This prevents spurious entry signals on startup when the regime
+        is already active (the bot would incorrectly see a 'transition')."""
+        data = self.dm.get_data(instrument)
+        h1 = self.dm.get_h1(instrument)
+        m5 = self.dm.get_m5(instrument)
+
+        if not data or h1 is None or m5 is None or len(m5) < 3:
+            return False
+
+        try:
+            indicators = project_indicators_to_m5(data, h1)
+            regime_mask = compute_regime_mask(indicators, vov_thresh)
+
+            if not windows:
+                return False
+
+            window_ids = compute_window_ids_array(m5.index)
+            wf_arr = np.array(sorted(windows), dtype=np.int64)
+            sess_mask = np.isin(window_ids, wf_arr)
+            active_mask = regime_mask & sess_mask
+
+            # Check second-to-last bar (the bar before the current latest)
+            return bool(active_mask[-2])
+        except Exception:
+            return False
+
+    def check_signal(self, instrument, last_processed_time=None):
         """
-        Check the latest completed M5 bar for an entry signal.
+        Check all new completed M5 bars for an entry signal.
+
+        Evaluates every bar since last_processed_time (not just the last bar)
+        to prevent silently losing signals when a cycle is missed.
 
         This replicates the backtest's inner loop logic:
           Source: lines 542-564
@@ -123,6 +159,7 @@ class Trader:
           'window_id': int (M30 window ID)
           'hurst': float
           'vov': float
+          'signal_bar_time': pd.Timestamp
         """
         data = self.dm.get_data(instrument)
         h1 = self.dm.get_h1(instrument)
@@ -157,50 +194,64 @@ class Trader:
         # Active mask = regime AND session
         active_mask = regime_mask & sess_mask
 
-        # Check the LAST COMPLETED bar (index -1 is latest)
-        # In backtest: signal at bar i, entry at bar i+1
-        # In live: we detect signal on bar i after it closes, and will enter on next bar
-        i = len(m5) - 1  # Latest completed bar
+        # Determine range of bars to evaluate: all bars since last_processed_time
+        if last_processed_time is not None:
+            start_idx = int((m5.index > last_processed_time).argmax())
+            if start_idx == 0 and m5.index[0] <= last_processed_time:
+                start_idx = len(m5) - 1  # No new bars, just check latest
+        else:
+            start_idx = len(m5) - 1  # First call, check latest only
 
-        if not active_mask[i]:
-            self.prev_active[instrument] = False
-            self.just_exited[instrument] = False
-            return None
+        # Evaluate each new bar sequentially (replicates backtest's per-bar loop)
+        for i in range(start_idx, len(m5)):
+            if not active_mask[i]:
+                self.prev_active[instrument] = False
+                self.just_exited[instrument] = False
+                continue
 
-        # Transition check: must be first bar of regime, or just re-entered
-        # Source: lines 548-549
-        prev_was_active = self.prev_active.get(instrument, False)
-        just_exited = self.just_exited.get(instrument, False)
+            # Transition check: must be first bar of regime, or just re-entered
+            # Source: lines 548-549
+            prev_was_active = self.prev_active.get(instrument, False)
+            just_exited = self.just_exited.get(instrument, False)
 
-        if prev_was_active and not just_exited:
-            # Regime was already active last bar and we didn't just exit
-            # → not a new signal, just continuation
+            if prev_was_active and not just_exited:
+                # Regime was already active last bar and we didn't just exit
+                # → not a new signal, just continuation
+                self.prev_active[instrument] = True
+                self.just_exited[instrument] = False
+                continue
+
+            # We have a valid signal!
             self.prev_active[instrument] = True
             self.just_exited[instrument] = False
-            return None
 
-        # We have a valid signal!
-        self.prev_active[instrument] = True
-        self.just_exited[instrument] = False
+            # Direction: sign of MTF bias
+            # Source: line 564
+            mtf_val = float(indicators['mtf_bias'][i])
+            direction = 'long' if mtf_val > 0 else 'short'
 
-        # Direction: sign of MTF bias
-        # Source: line 564
-        mtf_val = float(indicators['mtf_bias'][i])
-        direction = 'long' if mtf_val > 0 else 'short'
+            # ATR for SL computation
+            atr_val = float(indicators['atr'][i])
+            if np.isnan(atr_val):
+                atr_val = 0.0
 
-        # ATR for SL computation
-        atr_val = float(indicators['atr'][i])
-        if np.isnan(atr_val):
-            atr_val = 0.0
+            return {
+                'direction': direction,
+                'mtf_bias': mtf_val,
+                'atr': atr_val,
+                'window_id': int(window_ids[i]),
+                'hurst': float(indicators['hurst'][i]),
+                'vov': float(indicators['vov'][i]),
+                'signal_bar_time': m5.index[i],
+            }
 
-        return {
-            'direction': direction,
-            'mtf_bias': mtf_val,
-            'atr': atr_val,
-            'window_id': int(window_ids[i]),
-            'hurst': float(indicators['hurst'][i]),
-            'vov': float(indicators['vov'][i]),
-        }
+        return None
+
+    def on_entry_failed(self, instrument):
+        """Reset prev_active so the signal can re-fire on the next bar.
+        Without this, a spread rejection permanently consumes the signal
+        transition and the regime must turn OFF and ON again."""
+        self.prev_active[instrument] = False
 
     def execute_entry(self, instrument, signal):
         """
@@ -266,11 +317,16 @@ class Trader:
             trade_id = fill.get('tradeOpened', {}).get('tradeID') or fill.get('id', 'unknown')
             fill_price = float(fill.get('price', entry_price))
 
+            # Use the signal bar's M5 timestamp for entry_time so that
+            # bar counting in check_timed_exits matches the backtest's
+            # 48-bar hold period exactly (not ~49 bars from wall clock)
+            entry_time = signal.get('signal_bar_time', datetime.now(timezone.utc))
+
             position = OpenPosition(
                 trade_id=str(trade_id),
                 instrument=instrument,
                 direction=direction,
-                entry_time=datetime.now(timezone.utc),
+                entry_time=entry_time,
                 entry_price=fill_price,
                 sl_pips=sl_pips,
             )

@@ -27,6 +27,7 @@ from datetime import datetime, timezone, timedelta
 
 from config import (
     V1_MTF_THRESH, V1_HURST_THRESH, V1_VOV_PCT,
+    MTF_WEIGHTS,
     LONDON_WINDOWS,
     LONDON_MIN_SHARPE, LONDON_MIN_MEAN_PNL, LONDON_MIN_TRADES,
     ADDON_MIN_SHARPE, ADDON_MIN_MEAN_PNL, ADDON_MIN_TRADES,
@@ -180,7 +181,7 @@ def simulate_training_trades(m30_df, instrument, indicators, vov_thresh):
 
         trades.append({
             'pnl_pips': round(float(pnl_net), 2),
-            'm30_window': int(window_ids[i]),
+            'm30_window': int(window_ids[entry_bar]),
         })
 
         next_i = actual_exit_bar + 1
@@ -192,10 +193,14 @@ def simulate_training_trades(m30_df, instrument, indicators, vov_thresh):
     return trades
 
 
-def compute_window_metrics(trades):
+def compute_window_metrics(trades, training_years=1.0):
     """
     Compute metrics for a set of trades from one M30 window.
     Source: lines 894-916 (compute_window_metrics)
+
+    Args:
+        trades: list of trade dicts with 'pnl_pips'
+        training_years: duration of training data in years (for Sharpe annualization)
 
     Returns dict with: n_trades, total_pips, sharpe, win_rate, mean_pnl
     """
@@ -210,9 +215,9 @@ def compute_window_metrics(trades):
     mean_pnl = float(np.mean(pnls))
     std_pnl = float(np.std(pnls, ddof=1)) if n > 1 else 1.0
 
-    # Annualised Sharpe approximation
+    # Annualised Sharpe: use trades-per-year, not total trades
     # Source: lines 905-909
-    tpy = n  # trades in this window over the training period
+    tpy = n / max(training_years, 0.5)  # trades per year for this window
     sharpe = (mean_pnl / std_pnl * np.sqrt(tpy)) if std_pnl > 1e-10 else 0
 
     return {
@@ -339,13 +344,18 @@ def profile_windows_for_pair(data, h1_df, instrument):
         log.warning(f'{instrument}: only {len(trades)} training trades, skipping')
         return set(), vov_abs
 
+    # Compute training period duration for Sharpe annualization
+    m30 = data['M30']
+    training_days = (m30.index[-1] - m30.index[0]).days
+    training_years = max(training_days / 365.25, 0.5)
+
     # Profile each window
     # Source: lines 1027-1031
     window_profile = {}
     for wid in range(48):
         w_trades = [t for t in trades if t['m30_window'] == wid]
         if len(w_trades) >= 2:
-            window_profile[wid] = compute_window_metrics(w_trades)
+            window_profile[wid] = compute_window_metrics(w_trades, training_years)
 
     # Select windows
     selected = select_windows_london_selective(window_profile)
